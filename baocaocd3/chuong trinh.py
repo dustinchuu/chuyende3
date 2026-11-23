@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-DỰ ÁN: PHÂN TÍCH DỮ LIỆU MẠNG XÃ HỘI - PHÂN TÍCH TƯƠNG TÁC (LIKE, SHARE, COMMENT)
+DỰ ÁN: PHÂN TÍCH DỮ LIỆU MẠNG XÃ HỘI - PHÂN TÍCH TƯƠNG TÁC (LIKE, COMMENT) TRÊN YOUTUBE
+
+Dữ liệu: file data/youtube_posts.csv do youtube_collector.py (YouTube Data API v3) tạo ra,
+nằm CÙNG THƯ MỤC với file này -> không phụ thuộc vào Working directory của PyCharm.
 
 Các phần:
-  1. Nạp dữ liệu (CSV thật hoặc dữ liệu mẫu)
-  2. Làm sạch dữ liệu bài đăng
+  1. Nạp dữ liệu
+  2. Làm sạch dữ liệu
   3. Phân tích nội dung hiệu quả
   4. Phân tích tương tác theo thời gian
   5. Trực quan hóa engagement
@@ -12,11 +15,11 @@ Các phần:
 
 Cách chạy:
   pip install pandas numpy matplotlib seaborn scikit-learn
-  python social_media_analysis.py                 # dùng dữ liệu mẫu
-  python social_media_analysis.py data/youtube_posts.csv  # dữ liệu YouTube (từ youtube_collector.py)
+  python <tên file này>.py                    # tự đọc data/youtube_posts.csv cạnh file
+  python <tên file này>.py duong/dan/khac.csv # (tuỳ chọn) dùng file CSV khác
 
-Lưu ý với dữ liệu YouTube: API không có số lượt chia sẻ (share) -> code tự bỏ qua cột này,
-và dùng "tỷ lệ tương tác trên lượt xem" làm thước đo chính để loại bỏ ảnh hưởng của tuổi video.
+Lưu ý: YouTube API không có lượt chia sẻ (share) -> cột share bị bỏ qua. Thước đo chính là
+"tỷ lệ tương tác trên lượt xem" = (like + comment) / view, để loại ảnh hưởng của tuổi video.
 """
 
 import os
@@ -25,6 +28,8 @@ import sys
 import warnings
 from collections import Counter
 
+import matplotlib
+matplotlib.use("Agg")   # chỉ lưu ảnh, không mở cửa sổ -> tránh lỗi tkinter khi chạy trong PyCharm
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -45,7 +50,9 @@ plt.rcParams["axes.unicode_minus"] = False
 # ======================================================================
 # CẤU HÌNH
 # ======================================================================
-OUTPUT_DIR = "output"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))     # thư mục chứa file này
+DATA_PATH = os.path.join(BASE_DIR, "data", "youtube_posts.csv")
+OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 FIG_DIR = os.path.join(OUTPUT_DIR, "figures")
 RANDOM_STATE = 42
 
@@ -54,8 +61,8 @@ RANDOM_STATE = 42
 COLUMN_MAP = {
     "post_id": "post_id",
     "created_time": "created_time",   # thời điểm đăng
-    "post_type": "post_type",         # photo / video / text / link ...
-    "caption": "caption",             # nội dung bài viết
+    "post_type": "post_type",         # short / medium / long / live
+    "caption": "caption",             # tiêu đề video + hashtag
     "likes": "likes",
     "comments": "comments",
     "shares": "shares",
@@ -67,8 +74,8 @@ COLUMN_MAP = {
 # Chỉ giữ bài đã đăng ít nhất N ngày, vì số liệu bài quá mới chưa ổn định (có thể đặt 0 để tắt)
 MIN_AGE_DAYS = 30
 
-# Thước đo chính, được gán trong clean_data(): "Tỷ lệ tương tác / lượt xem (%)" hoặc "Tổng tương tác"
-METRIC_LABEL = "Tổng tương tác"
+# Thước đo chính của toàn bộ phân tích (xem docstring)
+METRIC_LABEL = "Tỷ lệ tương tác/lượt xem (%)"
 
 # Trọng số cho "engagement có trọng số" (share > comment > like về giá trị lan toả)
 WEIGHTS = {"likes": 1, "comments": 2, "shares": 3}
@@ -94,87 +101,24 @@ def save_fig(name):
 # ======================================================================
 # 1. NẠP DỮ LIỆU
 # ======================================================================
-def generate_sample_data(n=3000, seed=RANDOM_STATE):
-    """Sinh dữ liệu mô phỏng (có cố ý chèn lỗi) để chạy thử khi chưa có dữ liệu thật."""
-    rng = np.random.default_rng(seed)
-    start = pd.Timestamp("2025-01-01")
-    times = start + pd.to_timedelta(rng.integers(0, 365 * 24 * 60, n), unit="m")
-
-    types = rng.choice(["photo", "video", "text", "link", "reel"], n, p=[.30, .20, .15, .10, .25])
-    followers = (20000 + (times - start).days * 25 + rng.normal(0, 300, n)).astype(int)
-
-    topics = ["khuyến mãi", "sản phẩm mới", "mẹo hay", "review", "livestream", "tuyển dụng",
-              "bí quyết", "câu chuyện", "giveaway", "thông báo", "hướng dẫn", "cảm ơn khách hàng"]
-    tags_pool = ["#sale", "#new", "#tips", "#review", "#live", "#hanoi", "#viral", "#giveaway", "#trend", "#hot"]
-    emojis = ["🔥", "😍", "🎉", "👉", "❤️", "✨"]
-
-    captions, n_tags_list = [], []
-    for _ in range(n):
-        words = list(rng.choice(topics, rng.integers(1, 6)))
-        if rng.random() < .35:
-            words.append("bạn nghĩ sao?")
-        if rng.random() < .30:
-            words.append("https://example.com/p/" + str(rng.integers(1000, 9999)))
-        k = rng.integers(0, 7)
-        n_tags_list.append(k)
-        words += list(rng.choice(tags_pool, k, replace=False))
-        words += list(rng.choice(emojis, rng.integers(0, 4)))
-        captions.append(" ".join(words))
-
-    # Hiệu ứng ẩn: loại bài, khung giờ, cuối tuần, hashtag, câu hỏi...
-    type_map = {"photo": 1.0, "video": 1.4, "text": 0.7, "link": 0.6, "reel": 1.8}
-    type_eff = np.array([type_map[t] for t in types])
-    hour = np.array(times.hour)
-    hour_eff = 1 + 0.6 * np.exp(-((hour - 20) ** 2) / 8) + 0.3 * np.exp(-((hour - 12) ** 2) / 6)
-    wk_eff = np.where(np.array(times.dayofweek) >= 5, 1.25, 1.0)
-    tag_eff = 1 + 0.08 * np.minimum(n_tags_list, 5)
-    q_eff = np.array([1.3 if "?" in c else 1.0 for c in captions])
-    link_eff = np.array([0.8 if "http" in c else 1.0 for c in captions])
-    base = followers * 0.02 * type_eff * hour_eff * wk_eff * tag_eff * q_eff * link_eff
-    noise = rng.lognormal(0, 0.5, n)
-
-    likes = rng.poisson(base * noise)
-    comments = rng.poisson(base * noise * 0.10)
-    shares = rng.poisson(base * noise * 0.05)
-
-    df = pd.DataFrame({
-        "post_id": np.arange(1, n + 1), "created_time": times, "post_type": types,
-        "caption": captions, "likes": likes, "comments": comments, "shares": shares,
-        "followers": followers,
-    })
-
-    # ---- Chèn lỗi "bẩn" để minh hoạ bước làm sạch ----
-    df["created_time"] = df["created_time"].dt.strftime("%Y-%m-%d %H:%M:%S")
-    idx = rng.choice(n, 60, replace=False)
-    df.loc[idx, "created_time"] = pd.to_datetime(df.loc[idx, "created_time"]).dt.strftime("%d/%m/%Y %H:%M")
-    df.loc[rng.choice(n, 25, replace=False), "created_time"] = "không rõ"
-    df.loc[rng.choice(n, 80, replace=False), "likes"] = np.nan
-    df.loc[rng.choice(n, 40, replace=False), "comments"] = np.nan
-    df.loc[rng.choice(n, 30, replace=False), "shares"] = np.nan
-    df.loc[rng.choice(n, 20, replace=False), "caption"] = np.nan
-    df.loc[rng.choice(n, 15, replace=False), "likes"] = -5                    # giá trị âm
-    df.loc[rng.choice(n, 5, replace=False), "likes"] = 9_999_999              # ngoại lệ cực đoan
-    df["likes"] = df["likes"].astype("object")
-    for i in rng.choice(n, 30, replace=False):                                 # dạng "1.2K"
-        v = df.at[i, "likes"]
-        if pd.notna(v) and isinstance(v, (int, float, np.integer)) and v > 1000:
-            df.at[i, "likes"] = f"{v / 1000:.1f}K"
-    df.loc[rng.choice(n, 100, replace=False), "post_type"] = \
-        df.loc[rng.choice(n, 100, replace=False), "post_type"].str.upper().values[:100]
-    df = pd.concat([df, df.sample(50, random_state=seed)], ignore_index=True)  # trùng lặp
-    return df.sample(frac=1, random_state=seed).reset_index(drop=True)
+REQUIRED_COLUMNS = ["post_id", "created_time", "post_type", "caption", "likes", "comments", "views"]
 
 
-def load_data(path=None):
-    if path and os.path.exists(path):
-        print(f"[1] Đọc dữ liệu từ: {path}")
-        df = pd.read_csv(path)
-        rename = {v: k for k, v in COLUMN_MAP.items() if v in df.columns}
-        df = df.rename(columns=rename)
-    else:
-        print("[1] Không có file CSV -> dùng dữ liệu mẫu (mô phỏng).")
-        df = generate_sample_data()
+def load_data(path):
+    if not os.path.exists(path):
+        sys.exit(f"Không tìm thấy file dữ liệu:\n  {path}\n"
+                 "-> Hãy chạy file thu thập (youtube_collector) trước để tạo data/youtube_posts.csv.")
+    print(f"[1] Đọc dữ liệu từ: {path}")
+    df = pd.read_csv(path)
+    df = df.rename(columns={v: k for k, v in COLUMN_MAP.items() if v in df.columns})
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        sys.exit(f"File CSV thiếu cột bắt buộc: {missing}\nCác cột hiện có: {list(df.columns)}")
     print(f"    Kích thước dữ liệu gốc: {df.shape}")
+    if "channel_title" in df.columns:
+        print("    Số video theo kênh:")
+        for k, v in df["channel_title"].value_counts().items():
+            print(f"      - {k}: {v}")
     return df
 
 
@@ -213,68 +157,70 @@ def clean_text(s):
 
 
 def clean_data(df_raw):
-    global METRIC_LABEL
     print("\n[2] LÀM SẠCH DỮ LIỆU")
     report = {"số dòng ban đầu": len(df_raw)}
     df = df_raw.copy()
 
-    # 2.1 Xoá trùng lặp
+    # 2.1 Xoá trùng lặp (cùng một video)
     n0 = len(df)
-    df = df.drop_duplicates(subset=["post_id"]) if "post_id" in df else df.drop_duplicates()
-    report["trùng lặp đã xoá"] = n0 - len(df)
+    df = df.drop_duplicates(subset=["post_id"])
+    report["video trùng lặp đã xoá"] = n0 - len(df)
 
     # 2.2 Chuẩn hoá thời gian
     df["created_time"] = parse_datetime(df["created_time"].astype(str))
-    report["thời gian không hợp lệ (bị loại)"] = int(df["created_time"].isna().sum())
+    n0 = len(df)
     df = df.dropna(subset=["created_time"])
+    report["thời gian không hợp lệ (bị loại)"] = n0 - len(df)
 
-    # 2.2b Loại bài quá mới (số liệu chưa ổn định)
+    # 2.3 Loại video quá mới (số liệu chưa ổn định)
     if MIN_AGE_DAYS > 0:
         n0 = len(df)
         df = df[df["created_time"] <= pd.Timestamp.now() - pd.Timedelta(days=MIN_AGE_DAYS)]
-        report[f"bài đăng chưa đủ {MIN_AGE_DAYS} ngày (bị loại)"] = n0 - len(df)
+        report[f"video đăng chưa đủ {MIN_AGE_DAYS} ngày (bị loại)"] = n0 - len(df)
 
-    # 2.3 Chuẩn hoá số liệu tương tác
-    is_youtube = "views" in df.columns
-    if "shares" not in df.columns or df["shares"].isna().all():
-        df["shares"] = 0                       # nền tảng không cung cấp share (vd. YouTube)
-        report["cột shares"] = "không có dữ liệu -> đặt 0, bỏ qua trong phân tích"
-    if is_youtube:
-        df["views"] = pd.to_numeric(df["views"], errors="coerce")
-        n0 = len(df)
-        df = df[df["likes"].notna() & (df["views"] > 0)]       # kênh ẩn lượt thích / video không có view
-        report["video ẩn lượt thích hoặc 0 lượt xem (bị loại)"] = n0 - len(df)
-        df["comments"] = df["comments"].fillna(0)               # tắt bình luận -> 0
-    for c in ["likes", "comments", "shares"]:
+    # 2.4 Chuẩn hoá số liệu tương tác
+    for c in ["likes", "comments", "views"]:
         df[c] = df[c].apply(parse_count)
-    neg = (df[["likes", "comments", "shares"]] < 0).sum().sum()
-    report["giá trị âm -> NaN"] = int(neg)
-    for c in ["likes", "comments", "shares"]:
+    df["shares"] = 0                    # YouTube API không cung cấp lượt chia sẻ
+    report["cột shares"] = "YouTube không cung cấp -> bỏ qua trong phân tích"
+
+    n0 = len(df)
+    df = df[df["likes"].notna() & (df["views"] > 0)]            # kênh ẩn lượt thích / video chưa có lượt xem
+    report["video ẩn lượt thích hoặc 0 lượt xem (bị loại)"] = n0 - len(df)
+
+    report["giá trị âm -> NaN"] = int((df[["likes", "comments"]] < 0).sum().sum())
+    for c in ["likes", "comments"]:
         df.loc[df[c] < 0, c] = np.nan
+    report["video tắt bình luận (comment trống -> 0)"] = int(df["comments"].isna().sum())
+    df["comments"] = df["comments"].fillna(0)
 
-    # 2.4 Điền khuyết: dùng median theo loại bài đăng
-    df["post_type"] = df["post_type"].astype(str).str.strip().str.lower()
-    report["giá trị thiếu (likes/comments/shares)"] = int(df[["likes", "comments", "shares"]].isna().sum().sum())
-    for c in ["likes", "comments", "shares"]:
-        df[c] = df[c].fillna(df.groupby("post_type")[c].transform("median")).fillna(df[c].median())
+    # likes không được vượt views (dữ liệu bất thường)
+    n0 = len(df)
+    df = df[df["likes"] <= df["views"]]
+    report["video có like > view (bị loại)"] = n0 - len(df)
 
-    # 2.5 Followers / thời lượng (nếu có)
+    # 2.5 Thời lượng, người đăng ký, loại video
+    if "duration_sec" in df.columns:
+        df["duration_sec"] = pd.to_numeric(df["duration_sec"], errors="coerce")
+        n0 = len(df)
+        df = df[df["duration_sec"].isna() | (df["duration_sec"] > 0)]   # video 0 giây (premiere/live chưa phát)
+        report["video thời lượng 0 giây (bị loại)"] = n0 - len(df)
+        df["duration_sec"] = df["duration_sec"].fillna(df["duration_sec"].median())
     if "followers" in df.columns:
         df["followers"] = pd.to_numeric(df["followers"], errors="coerce")
+        report["video thiếu số đăng ký kênh (điền median)"] = int(df["followers"].isna().sum())
         df["followers"] = df["followers"].fillna(df["followers"].median())
     else:
         df["followers"] = np.nan
-    if "duration_sec" in df.columns:
-        df["duration_sec"] = pd.to_numeric(df["duration_sec"], errors="coerce")
-        df["duration_sec"] = df["duration_sec"].fillna(df["duration_sec"].median())
+    df["post_type"] = df["post_type"].astype(str).str.strip().str.lower()
 
-    # 2.6 Caption
+    # 2.6 Tiêu đề / caption
     df["caption"] = df["caption"].fillna("").astype(str)
-    report["caption trống"] = int((df["caption"].str.strip() == "").sum())
+    report["tiêu đề trống"] = int((df["caption"].str.strip() == "").sum())
 
     # 2.7 Xử lý ngoại lệ (winsorize theo phân vị 99.5%)
     out_cnt = 0
-    for c in ["likes", "comments", "shares"]:
+    for c in ["likes", "comments"]:
         cap = df[c].quantile(0.995)
         out_cnt += int((df[c] > cap).sum())
         df[c] = df[c].clip(upper=cap)
@@ -283,15 +229,8 @@ def clean_data(df_raw):
     # 2.8 Tạo đặc trưng
     df["total_engagement"] = df[["likes", "comments", "shares"]].sum(axis=1)
     df["weighted_engagement"] = sum(df[k] * w for k, w in WEIGHTS.items())
-    if is_youtube:
-        df["engagement_rate"] = df["total_engagement"] / df["views"] * 100
-        df["target_metric"] = df["engagement_rate"]
-        METRIC_LABEL = "Tỷ lệ tương tác/lượt xem (%)"
-    else:
-        if df["followers"].notna().any():
-            df["engagement_rate"] = df["total_engagement"] / df["followers"] * 100
-        df["target_metric"] = df["total_engagement"]
-        METRIC_LABEL = "Tổng tương tác"
+    df["engagement_rate"] = df["total_engagement"] / df["views"] * 100
+    df["target_metric"] = df["engagement_rate"]
     print(f"    - Thước đo chính được dùng: {METRIC_LABEL}")
 
     # Đặc trưng thời gian
@@ -316,6 +255,9 @@ def clean_data(df_raw):
 
     for k, v in report.items():
         print(f"    - {k}: {v}")
+    if len(df) < 200:
+        print("    [!] CẢNH BÁO: còn dưới 200 video, kết quả dự đoán sẽ kém tin cậy. "
+              "Hãy thu thập thêm kênh/video.")
     return df
 
 
@@ -649,7 +591,7 @@ def demo_predict(model, df, num_features):
 # ======================================================================
 def main():
     ensure_dirs()
-    path = sys.argv[1] if len(sys.argv) > 1 else None
+    path = sys.argv[1] if len(sys.argv) > 1 else DATA_PATH
 
     df_raw = load_data(path)
     df = clean_data(df_raw)
@@ -665,7 +607,7 @@ def main():
 
     metrics.to_csv(os.path.join(OUTPUT_DIR, "model_metrics.csv"), encoding="utf-8-sig")
     content["top_posts"].to_csv(os.path.join(OUTPUT_DIR, "top_posts.csv"), index=False, encoding="utf-8-sig")
-    print(f"\nHOÀN TẤT. Kết quả nằm trong thư mục '{OUTPUT_DIR}/'.")
+    print(f"\nHOÀN TẤT. Kết quả nằm trong thư mục:\n  {OUTPUT_DIR}")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
 ﻿Mô hình,R2 (log),MAE (đơn vị thước đo),RMSE (đơn vị thước đo)
-Linear Regression,0.398,594.353,908.108
-Random Forest,0.334,613.189,962.984
-Gradient Boosting,0.138,765.555,1105.858
+Linear Regression,-0.47,0.524,0.673
+Random Forest,0.14,0.325,0.579
+Gradient Boosting,-0.405,0.487,0.689

@@ -2,22 +2,19 @@
 """
 THU THẬP DỮ LIỆU TỪ YOUTUBE DATA API v3
 
-Xuất ra: data/youtube_posts.csv  (định dạng khớp với social_media_analysis.py)
+Xuất ra: data/youtube_posts.csv  (nằm CÙNG THƯ MỤC với file này, không phụ thuộc Working directory)
 
 Cách dùng:
-  1. Lấy API key (xem hướng dẫn trong tin nhắn / Google Cloud Console).
-  2. Đặt biến môi trường:
-        Windows (CMD):        set YOUTUBE_API_KEY=khoa_cua_ban
-        Windows (PowerShell): $env:YOUTUBE_API_KEY="khoa_cua_ban"
-        macOS / Linux:        export YOUTUBE_API_KEY=khoa_cua_ban
-  3. Sửa danh sách CHANNELS bên dưới (handle @ten, URL kênh, hoặc ID bắt đầu bằng UC...).
-  4. pip install requests pandas
-     python youtube_collector.py
+  1. API key: đặt biến môi trường YOUTUBE_API_KEY, HOẶC tạo file api_key.txt (chỉ chứa key)
+     cạnh file này. Đừng chia sẻ / đưa key lên mạng.
+  2. Danh sách kênh: sửa CHANNELS bên dưới, HOẶC tạo file channels.txt (mỗi dòng một kênh:
+     @handle, URL kênh, hoặc ID bắt đầu bằng UC...). Nếu có channels.txt thì dùng file đó.
+  3. pip install requests pandas
+     chạy file này.
 
-Tiết kiệm quota: script dùng channels.list + playlistItems.list + videos.list
-(mỗi lệnh gọi tốn 1 đơn vị, mỗi lần lấy tối đa 50 video) và KHÔNG dùng search.list
-(tốn 100 đơn vị/lần). Với hạn mức mặc định 10.000 đơn vị/ngày, thu thập vài nghìn
-video chỉ tốn khoảng vài trăm đơn vị.
+Tiết kiệm quota: chỉ dùng channels.list + playlistItems.list + videos.list (mỗi lệnh 1 đơn vị,
+tối đa 50 video/lần), KHÔNG dùng search.list. Nếu hết quota giữa chừng, dữ liệu đã thu được
+vẫn được lưu lại.
 """
 
 import os
@@ -31,21 +28,44 @@ import requests
 # ======================================================================
 # CẤU HÌNH
 # ======================================================================
-API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def load_api_key():
+    key = os.environ.get("YOUTUBE_API_KEY", "").strip()
+    key_file = os.path.join(BASE_DIR, "api_key.txt")
+    if not key and os.path.exists(key_file):
+        with open(key_file, encoding="utf-8") as f:
+            key = f.read().strip()
+    return key
+
+
+API_KEY = load_api_key()
 BASE_URL = "https://www.googleapis.com/youtube/v3"
 
 # Nên chọn 5-10 kênh CÙNG LĨNH VỰC (tin tức, ẩm thực, công nghệ, giải trí...),
 # mỗi kênh có từ 200 video trở lên. Thay các giá trị mẫu bên dưới bằng kênh thật.
 CHANNELS = [
+    "@ngoc6muitft",
     "@DTCLVN",
-    "@tiger1tft",
     "@EmChe",
-    "@YBY1TFT",
-    "@ghiendtcl"
+    "@ghiendtcl",
+    "@TrauTFT",
 ]
 
+
+def load_channels():
+    """Ưu tiên channels.txt (nếu có), nếu không dùng danh sách CHANNELS ở trên."""
+    path = os.path.join(BASE_DIR, "channels.txt")
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
+        if lines:
+            return lines
+    return CHANNELS
+
 MAX_VIDEOS_PER_CHANNEL = 500          # giới hạn số video mới nhất của mỗi kênh
-OUTPUT_PATH = os.path.join("data", "youtube_posts.csv")
+OUTPUT_PATH = os.path.join(BASE_DIR, "data", "youtube_posts.csv")
 LOCAL_TZ = "Asia/Ho_Chi_Minh"         # đổi giờ UTC của YouTube sang giờ Việt Nam
 
 _quota_used = 0
@@ -209,30 +229,51 @@ def build_rows(items, channel):
     return rows
 
 
+def save_csv(rows):
+    df = pd.DataFrame(rows).drop_duplicates(subset="post_id")
+    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+    df.to_csv(OUTPUT_PATH, index=False, encoding="utf-8-sig")
+    return df
+
+
 def main():
     if not API_KEY:
-        sys.exit("Chưa có API key. Hãy đặt biến môi trường YOUTUBE_API_KEY (xem hướng dẫn đầu file).")
+        sys.exit("Chưa có API key. Đặt biến môi trường YOUTUBE_API_KEY hoặc tạo file api_key.txt "
+                 f"(chỉ chứa key) trong thư mục:\n  {BASE_DIR}")
 
-    all_rows = []
-    for ident in CHANNELS:
+    channels = load_channels()
+    if any(c.startswith("@ten_kenh_") for c in channels):
+        sys.exit("Danh sách kênh vẫn là giá trị mẫu (@ten_kenh_...). Hãy sửa CHANNELS trong file này "
+                 "hoặc tạo file channels.txt với các kênh thật.")
+
+    all_rows, stopped = [], None
+    for ident in channels:
         print(f"\n>> Kênh: {ident}")
-        ch = resolve_channel(ident)
-        if not ch:
-            continue
-        ids = list_video_ids(ch["uploads_playlist"], MAX_VIDEOS_PER_CHANNEL)
-        print(f"   {ch['channel_title']}: tìm thấy {len(ids)} video, đang lấy chi tiết...")
-        rows = build_rows(get_video_details(ids), ch)
+        try:
+            ch = resolve_channel(ident)
+            if not ch:
+                continue
+            ids = list_video_ids(ch["uploads_playlist"], MAX_VIDEOS_PER_CHANNEL)
+            print(f"   {ch['channel_title']}: tìm thấy {len(ids)} video, đang lấy chi tiết...")
+            rows = build_rows(get_video_details(ids), ch)
+        except RuntimeError as e:
+            stopped = str(e)
+            print(f"   [!] Dừng ở kênh này: {e}")
+            break
         all_rows += rows
+        save_csv(all_rows)                      # lưu dần sau mỗi kênh để không mất dữ liệu
         print(f"   Đã lấy {len(rows)} video. (Quota đã dùng ~{_quota_used})")
 
     if not all_rows:
-        sys.exit("Không thu được dữ liệu nào. Kiểm tra lại danh sách CHANNELS.")
+        sys.exit("Không thu được dữ liệu nào. Kiểm tra lại danh sách kênh và API key.")
 
-    df = pd.DataFrame(all_rows).drop_duplicates(subset="post_id")
-    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
-    df.to_csv(OUTPUT_PATH, index=False, encoding="utf-8-sig")
-    print(f"\nHOÀN TẤT: {len(df)} video -> {OUTPUT_PATH}  (quota ước tính ~{_quota_used} đơn vị)")
-    print(f"Ngày thu thập: {pd.Timestamp.now():%d/%m/%Y} (hãy ghi vào báo cáo)")
+    df = save_csv(all_rows)
+    print(f"\nHOÀN TẤT: {len(df)} video từ {df['channel_id'].nunique()} kênh (quota ước tính ~{_quota_used} đơn vị)")
+    print(f"File: {OUTPUT_PATH}")
+    print(f"Ngày thu thập: {pd.Timestamp.now():%d/%m/%Y} ")
+    if stopped:
+        print("[!] Chưa thu thập hết các kênh (xem thông báo ở trên). Chạy lại sau khi khắc phục "
+              "sẽ thu thập lại từ đầu.")
 
 
 if __name__ == "__main__":
