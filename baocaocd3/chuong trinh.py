@@ -10,11 +10,13 @@ Các phần:
   2. Làm sạch dữ liệu
   3. Phân tích nội dung hiệu quả
   4. Phân tích tương tác theo thời gian
+     4B. Kiểm định thống kê (Mann-Whitney / Kruskal-Wallis / Spearman, hiệu chỉnh Holm)
+     4C. Kiểm soát yếu tố kênh (phân tích trong nội bộ từng kênh)
   5. Trực quan hóa engagement
-  6. Dự đoán mức độ tương tác (hồi quy + phân loại)
+  6. Dự đoán mức độ tương tác (hồi quy + phân loại, có baseline và kiểm tra trên kênh chưa từng thấy)
 
 Cách chạy:
-  pip install pandas numpy matplotlib seaborn scikit-learn
+  pip install pandas numpy scipy matplotlib seaborn scikit-learn
   python <tên file này>.py                    # tự đọc data/youtube_posts.csv cạnh file
   python <tên file này>.py duong/dan/khac.csv # (tuỳ chọn) dùng file CSV khác
 
@@ -34,9 +36,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from scipy import stats
 from sklearn.compose import ColumnTransformer
+from sklearn.dummy import DummyClassifier, DummyRegressor
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestClassifier, RandomForestRegressor
 from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import GroupKFold, TimeSeriesSplit, cross_val_score
 from sklearn.metrics import (ConfusionMatrixDisplay, accuracy_score, classification_report,
                              mean_absolute_error, mean_squared_error, r2_score)
 from sklearn.pipeline import Pipeline
@@ -46,6 +51,8 @@ warnings.filterwarnings("ignore")
 sns.set_theme(style="whitegrid", context="notebook")
 plt.rcParams["figure.dpi"] = 110
 plt.rcParams["axes.unicode_minus"] = False
+pd.set_option("display.width", 220)
+pd.set_option("display.max_columns", None)
 
 # ======================================================================
 # CẤU HÌNH
@@ -360,6 +367,238 @@ def analyze_time(df):
 
 
 # ======================================================================
+# 4B. KIỂM ĐỊNH THỐNG KÊ
+# ======================================================================
+MIN_GROUP = 30      # số video tối thiểu của mỗi nhóm để kiểm định
+ALPHA = 0.05
+
+
+def has_channels(df):
+    return "channel_title" in df.columns and df["channel_title"].nunique() > 1
+
+
+def add_channel_adjusted(df):
+    """metric_adj = log(1 + tỷ lệ tương tác) trừ trung bình của chính kênh đó.
+    So sánh trên cột này nghĩa là so sánh video TRONG NỘI BỘ từng kênh (loại hiệu ứng kênh)."""
+    lg = np.log1p(df["target_metric"])
+    if has_channels(df):
+        df["metric_adj"] = lg - lg.groupby(df["channel_title"]).transform("mean")
+    else:
+        df["metric_adj"] = lg
+    return df
+
+
+def holm(pvals):
+    """Hiệu chỉnh Holm-Bonferroni cho nhiều phép kiểm định cùng lúc."""
+    p = np.asarray(pvals, dtype=float)
+    n, order = len(p), np.argsort(p)
+    adj, running = np.empty(n), 0.0
+    for rank, i in enumerate(order):
+        running = max(running, (n - rank) * p[i])
+        adj[i] = min(1.0, running)
+    return adj
+
+
+def magnitude(value, kind):
+    """Diễn giải độ lớn hiệu ứng. kind='r' (rank-biserial / Spearman) hoặc 'eps' (epsilon bình phương)."""
+    a = abs(value)
+    t = (0.1, 0.3, 0.5) if kind == "r" else (0.01, 0.06, 0.14)
+    return "không đáng kể" if a < t[0] else "nhỏ" if a < t[1] else "trung bình" if a < t[2] else "lớn"
+
+
+def build_tests(df):
+    tests = [dict(h="H1: Hình thức video (short/medium/long/live) làm tỷ lệ tương tác khác nhau",
+                  kind="multi", col="post_type")]
+    types = set(df["post_type"])
+    if {"short", "long"} <= types:
+        tests.append(dict(h="H2: Video ngắn (<=60 giây) vs video dài (>10 phút)", kind="binary",
+                          a=df["post_type"] == "short", b=df["post_type"] == "long", la="ngắn", lb="dài"))
+    ev = df["hour"].between(18, 23)
+    tests.append(dict(h="H3: Đăng buổi tối (18-23h) vs các khung giờ khác", kind="binary",
+                      a=ev, b=~ev, la="tối", lb="khác"))
+    tests.append(dict(h="H4: Đăng cuối tuần vs ngày thường", kind="binary",
+                      a=df["is_weekend"] == 1, b=df["is_weekend"] == 0, la="cuối tuần", lb="ngày thường"))
+    tests.append(dict(h="H5: Tiêu đề có dấu '?' vs không có", kind="binary",
+                      a=df["has_question"] == 1, b=df["has_question"] == 0, la="có ?", lb="không ?"))
+    tests.append(dict(h="H6: Có hashtag vs không có hashtag", kind="binary",
+                      a=df["n_hashtags"] > 0, b=df["n_hashtags"] == 0, la="có hashtag", lb="không hashtag"))
+    tests.append(dict(h="H7: Độ dài tiêu đề tương quan với tỷ lệ tương tác", kind="corr", x="caption_len"))
+    if "duration_sec" in df.columns:
+        tests.append(dict(h="H8: Thời lượng video tương quan với tỷ lệ tương tác", kind="corr", x="duration_sec"))
+    return tests
+
+
+def run_test(t, df, col):
+    """Trả về dict(p, eff, kind, sign) hoặc None nếu không đủ dữ liệu."""
+    y = df[col]
+    if t["kind"] == "binary":
+        a, b = y[t["a"]], y[t["b"]]
+        if len(a) < MIN_GROUP or len(b) < MIN_GROUP:
+            return None
+        u, p = stats.mannwhitneyu(a, b, alternative="two-sided")
+        eff = 2 * u / (len(a) * len(b)) - 1            # rank-biserial: >0 nghĩa là nhóm A cao hơn
+        return dict(p=p, eff=eff, kind="r", sign=int(np.sign(a.median() - b.median())))
+    if t["kind"] == "multi":
+        groups = [g[col].values for _, g in df.groupby(t["col"]) if len(g) >= MIN_GROUP]
+        if len(groups) < 2:
+            return None
+        h, p = stats.kruskal(*groups)
+        n, k = sum(len(g) for g in groups), len(groups)
+        return dict(p=p, eff=max(0.0, (h - k + 1) / (n - k)), kind="eps", sign=0)
+    rho, p = stats.spearmanr(df[t["x"]], y)
+    return dict(p=p, eff=rho, kind="r", sign=int(np.sign(rho)))
+
+
+def channel_consistency(t, df, overall_sign):
+    """Đếm số kênh có chiều ảnh hưởng cùng chiều với kết quả chung."""
+    if not has_channels(df) or overall_sign == 0 or t["kind"] == "multi":
+        return ""
+    same = total = 0
+    for _, g in df.groupby("channel_title"):
+        if t["kind"] == "binary":
+            a = g.loc[t["a"].loc[g.index], "target_metric"]
+            b = g.loc[t["b"].loc[g.index], "target_metric"]
+            if len(a) < 10 or len(b) < 10:
+                continue
+            s = np.sign(a.median() - b.median())
+        else:
+            if len(g) < MIN_GROUP:
+                continue
+            s = np.sign(stats.spearmanr(g[t["x"]], g["target_metric"])[0])
+        total += 1
+        same += int(s == overall_sign)
+    return f"{same}/{total} kênh" if total else ""
+
+
+def describe_groups(t, df):
+    y = df["target_metric"]
+    if t["kind"] == "binary":
+        a, b = y[t["a"]], y[t["b"]]
+        return (f"{t['la']}: trung vị {a.median():.2f} (n={len(a)}) | "
+                f"{t['lb']}: trung vị {b.median():.2f} (n={len(b)})")
+    if t["kind"] == "multi":
+        g = df.groupby(t["col"])["target_metric"].agg(["median", "count"])
+        g = g[g["count"] >= MIN_GROUP]
+        return " | ".join(f"{i}: {r['median']:.2f} (n={int(r['count'])})" for i, r in g.iterrows())
+    return f"Spearman rho giữa {t['x']} và tỷ lệ tương tác"
+
+
+def statistical_tests(df):
+    print(f"\n[4B] KIỂM ĐỊNH THỐNG KÊ (mức ý nghĩa {ALPHA}; hiệu chỉnh Holm cho nhiều phép kiểm định)")
+    print("     Kiểm định phi tham số (Mann-Whitney / Kruskal-Wallis / Spearman) vì tỷ lệ tương tác lệch phải.")
+    use_adj = has_channels(df)
+    items = []
+    for t in build_tests(df):
+        raw = run_test(t, df, "target_metric")
+        if raw is None:
+            print(f"    - Bỏ qua '{t['h'][:2]}' (nhóm có dưới {MIN_GROUP} video).")
+            continue
+        items.append((t, raw, run_test(t, df, "metric_adj") if use_adj else None))
+    if not items:
+        return pd.DataFrame()
+
+    p_raw = holm([r["p"] for _, r, _ in items])
+    p_adj = holm([a["p"] for _, _, a in items]) if use_adj else [np.nan] * len(items)
+
+    rows = []
+    for (t, raw, adj), pr, pa in zip(items, p_raw, p_adj):
+        sig_raw, sig_adj = pr < ALPHA, (pa < ALPHA) if use_adj else None
+        small = magnitude(raw["eff"], raw["kind"]) == "không đáng kể"
+        if not use_adj:
+            concl = "Có ý nghĩa thống kê" if sig_raw else "Chưa đủ bằng chứng"
+        elif sig_raw and sig_adj:
+            concl = "Có ý nghĩa và vẫn giữ nguyên sau khi kiểm soát kênh"
+        elif sig_raw and not sig_adj:
+            concl = "Có ý nghĩa nhưng MẤT đi sau khi kiểm soát kênh (có thể chỉ là hiệu ứng của kênh)"
+        elif sig_adj:
+            concl = "Chỉ xuất hiện khi kiểm soát kênh"
+        else:
+            concl = "Chưa đủ bằng chứng (không bác bỏ được giả thuyết không)"
+        if (sig_raw or sig_adj) and small:
+            concl += "; hiệu ứng rất nhỏ"
+        cons = channel_consistency(t, df, raw["sign"])
+        row = {"Giả thuyết": t["h"], "Mô tả nhóm": describe_groups(t, df),
+               "p Holm (gốc)": pr, "Hiệu ứng (gốc)": raw["eff"],
+               "Mức độ (gốc)": magnitude(raw["eff"], raw["kind"]),
+               "p Holm (kiểm soát kênh)": pa,
+               "Hiệu ứng (kiểm soát kênh)": adj["eff"] if adj else np.nan,
+               "Cùng chiều theo kênh": cons, "Kết luận": concl}
+        rows.append(row)
+        print(f"\n  {t['h']}")
+        print(f"     {row['Mô tả nhóm']}")
+        line = f"     Gốc: p_Holm={pr:.4f}, hiệu ứng={raw['eff']:+.3f} ({row['Mức độ (gốc)']})"
+        if adj:
+            line += (f" | Kiểm soát kênh: p_Holm={pa:.4f}, hiệu ứng={adj['eff']:+.3f}"
+                     f" ({magnitude(adj['eff'], adj['kind'])})")
+        print(line)
+        if cons:
+            print(f"     Cùng chiều với kết quả chung ở: {cons}")
+        print(f"     => {concl}")
+
+    table = pd.DataFrame(rows)
+    table.round(4).to_csv(os.path.join(OUTPUT_DIR, "statistical_tests.csv"), index=False, encoding="utf-8-sig")
+    print("\n     Lưu ý: ý nghĩa thống kê cho biết khác biệt khó là do ngẫu nhiên, KHÔNG cho biết nguyên nhân. "
+          "Đây là quan hệ tương quan, chưa phải nhân quả.")
+    return table
+
+
+# ======================================================================
+# 4C. KIỂM SOÁT YẾU TỐ GÂY NHIỄU: KÊNH
+# ======================================================================
+def eta_squared(values, groups):
+    """Tỷ lệ phương sai của `values` được giải thích bởi `groups` (0-1)."""
+    values = pd.Series(np.asarray(values, dtype=float))
+    groups = pd.Series(np.asarray(groups))
+    ss_total = ((values - values.mean()) ** 2).sum()
+    ss_between = sum(len(g) * (g.mean() - values.mean()) ** 2 for _, g in values.groupby(groups))
+    return ss_between / ss_total if ss_total > 0 else 0.0
+
+
+def channel_analysis(df):
+    print("\n[4C] KIỂM SOÁT YẾU TỐ KÊNH (loại trừ yếu tố gây nhiễu)")
+    if not has_channels(df):
+        print("     Dữ liệu chỉ có 1 kênh hoặc thiếu cột channel_title -> bỏ qua.")
+        return
+    summary = df.groupby("channel_title").agg(
+        so_video=("post_id", "count"), nguoi_dang_ky=("followers", "median"),
+        ty_le_trung_vi=("target_metric", "median"), ty_le_trung_binh=("target_metric", "mean")
+    ).round(2).sort_values("nguoi_dang_ky", ascending=False)
+    print("\n  >> Tổng quan từng kênh:\n", summary)
+    summary.to_csv(os.path.join(OUTPUT_DIR, "channel_summary.csv"), encoding="utf-8-sig")
+
+    lg = np.log1p(df["target_metric"])
+    e_ch = eta_squared(lg, df["channel_title"])
+    e_ty = eta_squared(lg, df["post_type"])
+    print(f"\n  >> Kênh giải thích ~{e_ch * 100:.1f}% biến thiên của tỷ lệ tương tác (log); "
+          f"hình thức video giải thích ~{e_ty * 100:.1f}%.")
+    if e_ch > e_ty:
+        print("     => Yếu tố kênh ảnh hưởng mạnh hơn hình thức video: cần kiểm soát kênh khi kết luận.")
+
+    ct = pd.crosstab(df["channel_title"], df["post_type"])
+    if ct.shape[0] > 1 and ct.shape[1] > 1:
+        chi2, p, _, _ = stats.chi2_contingency(ct)
+        v = np.sqrt(chi2 / (ct.values.sum() * (min(ct.shape) - 1)))
+        print(f"\n  >> Cơ cấu hình thức video giữa các kênh: chi-bình phương p={p:.4g}, Cramér's V={v:.2f}")
+        if p < ALPHA:
+            print("     => Các kênh dùng hình thức video KHÁC NHAU (tiềm ẩn gây nhiễu): "
+                  "so sánh gộp giữa các hình thức có thể bị ảnh hưởng bởi kênh.")
+        else:
+            print("     => Cơ cấu hình thức video giữa các kênh tương đối giống nhau.")
+
+        fig, ax = plt.subplots(1, 2, figsize=(14, max(4, 0.6 * ct.shape[0] + 2)))
+        piv = df.pivot_table(index="channel_title", columns="post_type", values="target_metric", aggfunc="median")
+        sns.heatmap(piv, annot=True, fmt=".2f", cmap="YlGnBu", ax=ax[0], cbar_kws={"label": "Trung vị"})
+        ax[0].set_title(f"{METRIC_LABEL}: trung vị theo kênh x hình thức")
+        ax[0].set_ylabel("")
+        (ct.div(ct.sum(axis=1), axis=0) * 100).plot(kind="barh", stacked=True, ax=ax[1], colormap="Set2")
+        ax[1].set_title("Cơ cấu hình thức video của từng kênh (%)")
+        ax[1].set_ylabel("")
+        ax[1].set_xlabel("%")
+        ax[1].legend(title="Hình thức", loc="upper left", bbox_to_anchor=(1.01, 1))
+        save_fig("15_kenh_x_hinh_thuc.png")
+
+
+# ======================================================================
 # 5. TRỰC QUAN HOÁ
 # ======================================================================
 def visualize(df, content, timeres):
@@ -475,35 +714,20 @@ def visualize(df, content, timeres):
 CANDIDATE_NUM = ["hour", "weekday", "month", "is_weekend", "caption_len", "word_count",
                  "n_hashtags", "n_emoji", "has_link", "has_question", "followers", "duration_sec"]
 CAT_FEATURES = ["post_type"]
+BASELINE = "Baseline (luôn đoán bằng trung bình)"
+RF_CHANNEL = "Random Forest + biến kênh"
 
 
-def build_preprocessor(num_features):
+def build_preprocessor(num_features, cat_features=None):
     return ColumnTransformer([
         ("num", StandardScaler(), num_features),
-        ("cat", OneHotEncoder(handle_unknown="ignore"), CAT_FEATURES),
+        ("cat", OneHotEncoder(handle_unknown="ignore"), cat_features or CAT_FEATURES),
     ])
 
 
-def predict_engagement(df):
-    print("\n[6] DỰ ĐOÁN MỨC ĐỘ TƯƠNG TÁC")
-    data = df.copy()
-    if data["followers"].isna().all():
-        data["followers"] = 0
-    # bỏ đặc trưng không có hoặc không đổi (vd. duration_sec khi dữ liệu không có)
-    num_features = [c for c in CANDIDATE_NUM if c in data.columns and data[c].nunique() > 1]
-    feats = num_features + CAT_FEATURES
-    print(f"    Thước đo dự đoán: {METRIC_LABEL}")
-    print(f"    Đặc trưng số: {num_features}")
-
-    X = data[feats]
-    y = np.log1p(data["target_metric"])        # log để giảm lệch phải
-
-    # Chia theo thời gian: 80% bài cũ để huấn luyện, 20% bài mới để kiểm tra
-    cut = int(len(data) * 0.8)
-    X_tr, X_te, y_tr, y_te = X.iloc[:cut], X.iloc[cut:], y.iloc[:cut], y.iloc[cut:]
-    print(f"    Train: {len(X_tr)} bài | Test: {len(X_te)} bài (chia theo thời gian)")
-
-    models = {
+def make_regressors():
+    return {
+        BASELINE: DummyRegressor(strategy="mean"),
         "Linear Regression": LinearRegression(),
         "Random Forest": RandomForestRegressor(n_estimators=300, min_samples_leaf=3,
                                                random_state=RANDOM_STATE, n_jobs=-1),
@@ -511,27 +735,107 @@ def predict_engagement(df):
                                                        max_depth=3, random_state=RANDOM_STATE),
     }
 
-    rows, fitted = [], {}
-    for name, mdl in models.items():
-        pipe = Pipeline([("prep", build_preprocessor(num_features)), ("model", mdl)]).fit(X_tr, y_tr)
-        pred = pipe.predict(X_te)
-        pred_real, y_real = np.expm1(pred), np.expm1(y_te)
-        rows.append({
-            "Mô hình": name,
-            "R2 (log)": r2_score(y_te, pred),
-            "MAE (đơn vị thước đo)": mean_absolute_error(y_real, pred_real),
-            "RMSE (đơn vị thước đo)": np.sqrt(mean_squared_error(y_real, pred_real)),
-        })
-        fitted[name] = (pipe, pred_real)
-    result = pd.DataFrame(rows).set_index("Mô hình").round(3)
-    print("\n  >> So sánh mô hình hồi quy:\n", result)
 
-    best_name = result["R2 (log)"].idxmax()
+def evaluate_model(name, mdl, X, y, cut, num_features, cat_features=None):
+    """Huấn luyện trên 80% bài cũ, kiểm tra trên 20% bài mới + kiểm chứng chéo theo thời gian."""
+    pipe = Pipeline([("prep", build_preprocessor(num_features, cat_features)), ("model", mdl)])
+    pipe.fit(X.iloc[:cut], y.iloc[:cut])
+    pred = pipe.predict(X.iloc[cut:])
+    y_te = y.iloc[cut:]
+    pred_real, y_real = np.expm1(pred), np.expm1(y_te)
+    cv = cross_val_score(pipe, X, y, cv=TimeSeriesSplit(n_splits=5), scoring="r2")
+    row = {"Mô hình": name, "R2 (log)": r2_score(y_te, pred),
+           "R2 CV theo thời gian (TB)": cv.mean(), "R2 CV (độ lệch chuẩn)": cv.std(),
+           "MAE (đơn vị thước đo)": mean_absolute_error(y_real, pred_real),
+           "RMSE (đơn vị thước đo)": np.sqrt(mean_squared_error(y_real, pred_real))}
+    return row, pipe, pred_real
+
+
+def predict_engagement(df):
+    print("\n[6] DỰ ĐOÁN MỨC ĐỘ TƯƠNG TÁC")
+    data = df.copy()
+    if data["followers"].isna().all():
+        data["followers"] = 0
+    # bỏ đặc trưng không có hoặc không đổi
+    num_features = [c for c in CANDIDATE_NUM if c in data.columns and data[c].nunique() > 1]
+    feats = num_features + CAT_FEATURES
+    print(f"    Thước đo dự đoán: {METRIC_LABEL}")
+    print(f"    Đặc trưng số: {num_features}")
+
+    X = data[feats]
+    y = np.log1p(data["target_metric"])        # log để giảm lệch phải
+    cut = int(len(data) * 0.8)                 # chia theo thời gian: 80% bài cũ -> 20% bài mới
+    print(f"    Train: {cut} bài | Test: {len(data) - cut} bài (chia theo thời gian)")
+
+    rows, fitted = [], {}
+    for name, mdl in make_regressors().items():
+        row, pipe, pred_real = evaluate_model(name, mdl, X, y, cut, num_features)
+        rows.append(row)
+        fitted[name] = (pipe, pred_real)
+
+    # Mô hình có thêm biến "kênh": cho biết danh tính kênh giúp dự đoán được bao nhiêu
+    if has_channels(data):
+        X_ch = data[feats + ["channel_title"]]
+        row, _, _ = evaluate_model(
+            RF_CHANNEL, RandomForestRegressor(n_estimators=300, min_samples_leaf=3,
+                                              random_state=RANDOM_STATE, n_jobs=-1),
+            X_ch, y, cut, num_features, CAT_FEATURES + ["channel_title"])
+        rows.append(row)
+
+    result = pd.DataFrame(rows).set_index("Mô hình")
+    base = result.loc[BASELINE]
+    result["MAE giảm so với baseline (%)"] = (base["MAE (đơn vị thước đo)"]
+                                              - result["MAE (đơn vị thước đo)"]) / base["MAE (đơn vị thước đo)"] * 100
+    result = result.round(3)
+    print("\n  >> So sánh mô hình hồi quy (có baseline để đối chiếu):\n", result.T)
+
+    candidates = [n for n in ["Linear Regression", "Random Forest", "Gradient Boosting"]]
+    best_name = result.loc[candidates, "R2 (log)"].idxmax()
     best_pipe, best_pred = fitted[best_name]
-    print(f"\n    => Mô hình tốt nhất: {best_name}")
+    r2_best, r2_base = result.loc[best_name, "R2 (log)"], result.loc[BASELINE, "R2 (log)"]
+    print(f"\n    => Mô hình tốt nhất: {best_name} | R2 = {r2_best:.3f} (baseline: {r2_base:.3f}) "
+          f"| MAE giảm {result.loc[best_name, 'MAE giảm so với baseline (%)']:.1f}% so với baseline")
+    if r2_best < 0.10:
+        print("    => Mô hình giải thích được RẤT ÍT biến thiên của tương tác. "
+              "Hãy nêu rõ trong báo cáo: các đặc trưng có sẵn trước khi đăng không đủ để dự đoán tốt.")
+    elif r2_best < 0.30:
+        print("    => Khả năng dự đoán ở mức KHIÊM TỐN: chỉ nên dùng để tham khảo xu hướng, không dùng để dự đoán chính xác.")
+    else:
+        print("    => Khả năng dự đoán ở mức KHÁ, nhưng vẫn cần thận trọng khi áp dụng cho kênh/giai đoạn mới.")
+    if has_channels(data) and RF_CHANNEL in result.index:
+        gain = result.loc[RF_CHANNEL, "R2 (log)"] - result.loc["Random Forest", "R2 (log)"]
+        print(f"    => Thêm biến 'kênh' làm R2 thay đổi {gain:+.3f}: "
+              + ("danh tính kênh chứa thêm nhiều thông tin dự đoán." if gain > 0.05 else
+                 "danh tính kênh bổ sung không nhiều (lưu ý: số người đăng ký 'followers' đã phân biệt "
+                 "được các kênh với nhau nên phần lớn thông tin về kênh đã có sẵn trong mô hình)."))
+
+    # Kiểm tra khả năng dự đoán cho KÊNH CHƯA TỪNG THẤY (bỏ lần lượt từng kênh ra làm tập kiểm tra)
+    loco = {}
+    if has_channels(data) and data["channel_title"].nunique() >= 3:
+        groups = data["channel_title"]
+        gkf = GroupKFold(n_splits=min(5, groups.nunique()))
+        for label_, mdl in [("Random Forest", RandomForestRegressor(n_estimators=200, min_samples_leaf=3,
+                                                                   random_state=RANDOM_STATE, n_jobs=-1)),
+                            (BASELINE, DummyRegressor(strategy="mean"))]:
+            pipe = Pipeline([("prep", build_preprocessor(num_features)), ("model", mdl)])
+            sc = cross_val_score(pipe, X, y, groups=groups, cv=gkf, scoring="r2")
+            loco[label_] = sc
+        print("\n  >> Dự đoán cho kênh CHƯA TỪNG THẤY (kiểm chứng chéo theo nhóm kênh), R2 từng lượt:")
+        for k, v in loco.items():
+            print(f"     {k}: {np.round(v, 3)} | trung bình {v.mean():.3f}")
+        pd.DataFrame({k: v for k, v in loco.items()}).round(4).to_csv(
+            os.path.join(OUTPUT_DIR, "model_unseen_channels.csv"), index=False, encoding="utf-8-sig")
+        rf_m, bs_m = loco["Random Forest"].mean(), loco[BASELINE].mean()
+        if rf_m <= bs_m + 0.02:
+            print("     => Mô hình gần như KHÔNG tốt hơn baseline khi áp dụng cho kênh mới.")
+        elif rf_m < 0:
+            print("     => Mô hình khá hơn baseline nhưng R2 vẫn ÂM: với kênh chưa từng thấy, dự đoán "
+                  "kém hơn cả việc đã biết mức trung bình của kênh đó (mỗi kênh có mức tương tác nền khác nhau).")
+        print("     => Kết quả dự đoán ở mục trên chỉ đáng tin trong phạm vi các kênh đã thu thập; "
+              "hãy nêu rõ điều này ở phần hạn chế của báo cáo.")
 
     # Biểu đồ thực tế vs dự đoán
-    y_real = np.expm1(y_te)
+    y_real = np.expm1(y.iloc[cut:])
     plt.figure(figsize=(6, 6))
     plt.scatter(y_real, best_pred, alpha=.35, s=14, color="#4C72B0")
     lim = [0, max(y_real.max(), best_pred.max())]
@@ -553,15 +857,19 @@ def predict_engagement(df):
     save_fig("13_feature_importance.png")
     print("\n  >> Top 5 yếu tố ảnh hưởng nhất:\n", imp.sort_values(ascending=False).head(5).round(3))
 
-    # ---- Phân loại mức độ: Thấp / Trung bình / Cao (theo ngưỡng phân vị của tập train) ----
+    # ---- Phân loại mức độ: Thấp / Trung bình / Cao (ngưỡng phân vị của tập train) ----
     q1, q2 = data["target_metric"].iloc[:cut].quantile([1 / 3, 2 / 3])
     label = pd.cut(data["target_metric"], [-np.inf, q1, q2, np.inf], labels=["Thấp", "Trung bình", "Cao"])
+    X_tr, X_te = X.iloc[:cut], X.iloc[cut:]
     clf = Pipeline([("prep", build_preprocessor(num_features)),
                     ("model", RandomForestClassifier(n_estimators=300, min_samples_leaf=3,
                                                      random_state=RANDOM_STATE, n_jobs=-1))])
     clf.fit(X_tr, label.iloc[:cut])
     pred_c = clf.predict(X_te)
-    print(f"\n  >> Phân loại mức tương tác - Accuracy: {accuracy_score(label.iloc[cut:], pred_c):.3f}")
+    dummy_c = DummyClassifier(strategy="most_frequent").fit(X_tr, label.iloc[:cut])
+    acc, acc_base = accuracy_score(label.iloc[cut:], pred_c), accuracy_score(label.iloc[cut:], dummy_c.predict(X_te))
+    print(f"\n  >> Phân loại mức tương tác - Accuracy: {acc:.3f} (baseline luôn đoán nhóm phổ biến nhất: {acc_base:.3f}; "
+          f"đoán ngẫu nhiên ~0.333)")
     print(classification_report(label.iloc[cut:], pred_c, zero_division=0))
     fig, ax = plt.subplots(figsize=(5.5, 5))
     ConfusionMatrixDisplay.from_predictions(label.iloc[cut:], pred_c,
@@ -595,11 +903,14 @@ def main():
 
     df_raw = load_data(path)
     df = clean_data(df_raw)
+    df = add_channel_adjusted(df)
     df.drop(columns=["date"]).to_csv(os.path.join(OUTPUT_DIR, "posts_cleaned.csv"),
                                      index=False, encoding="utf-8-sig")
 
     content = analyze_content(df)
     timeres = analyze_time(df)
+    statistical_tests(df)
+    channel_analysis(df)
     visualize(df, content, timeres)
 
     model, metrics, clf, num_features = predict_engagement(df)
