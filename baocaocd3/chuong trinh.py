@@ -28,7 +28,6 @@ import os
 import re
 import sys
 import warnings
-from collections import Counter
 
 import matplotlib
 matplotlib.use("Agg")   # chỉ lưu ảnh, không mở cửa sổ -> tránh lỗi tkinter khi chạy trong PyCharm
@@ -84,8 +83,15 @@ MIN_AGE_DAYS = 30
 # Thước đo chính của toàn bộ phân tích (xem docstring)
 METRIC_LABEL = "Tỷ lệ tương tác/lượt xem (%)"
 
-# Trọng số cho "engagement có trọng số" (share > comment > like về giá trị lan toả)
-WEIGHTS = {"likes": 1, "comments": 2, "shares": 3}
+# Thước đo dùng cho các bảng/biểu đồ so sánh ở mục 3, 4, 5. Khi có nhiều kênh, dùng CHỈ SỐ TƯƠNG ĐỐI
+# so với trung vị của chính kênh đó (1.0 = mức thường thấy của kênh) để loại hiệu ứng quy mô/phong cách kênh.
+# Giá trị được gán lại trong add_channel_adjusted().
+REL_LABEL = "Chỉ số tương đối so với kênh (1 = mức thường của kênh)"
+ANALYSIS_COL = "target_metric"
+ANALYSIS_LABEL = METRIC_LABEL
+
+# Khung giờ dùng cho heatmap (gộp để mỗi ô có đủ video, tránh nhiễu)
+TIME_BANDS = ["Đêm (0-5h)", "Sáng (6-11h)", "Trưa (12-13h)", "Chiều (14-17h)", "Tối (18-23h)"]
 
 STOPWORDS_VI = set("""
 và của là có cho những các một được trong với này đã để không khi cũng như
@@ -225,28 +231,24 @@ def clean_data(df_raw):
     df["caption"] = df["caption"].fillna("").astype(str)
     report["tiêu đề trống"] = int((df["caption"].str.strip() == "").sum())
 
-    # 2.7 Xử lý ngoại lệ (winsorize theo phân vị 99.5%)
-    out_cnt = 0
-    for c in ["likes", "comments"]:
-        cap = df[c].quantile(0.995)
-        out_cnt += int((df[c] > cap).sum())
-        df[c] = df[c].clip(upper=cap)
-    report["ngoại lệ bị cắt ngưỡng (winsorize)"] = out_cnt
-
     # 2.8 Tạo đặc trưng
     df["total_engagement"] = df[["likes", "comments", "shares"]].sum(axis=1)
-    df["weighted_engagement"] = sum(df[k] * w for k, w in WEIGHTS.items())
     df["engagement_rate"] = df["total_engagement"] / df["views"] * 100
+
+    # Xử lý ngoại lệ: cắt ngưỡng 99,5% trên chính TỶ LỆ tương tác. Không cắt số đếm like/comment,
+    # vì cắt số đếm sẽ làm thiệt các kênh lớn có lượng like/view lớn hợp lệ (thiên lệch theo quy mô kênh).
+    cap = df["engagement_rate"].quantile(0.995)
+    report["ngoại lệ tỷ lệ tương tác bị cắt ngưỡng 99,5% (winsorize)"] = int((df["engagement_rate"] > cap).sum())
+    df["engagement_rate"] = df["engagement_rate"].clip(upper=cap)
     df["target_metric"] = df["engagement_rate"]
     print(f"    - Thước đo chính được dùng: {METRIC_LABEL}")
 
     # Đặc trưng thời gian
     df["hour"] = df["created_time"].dt.hour
     df["weekday"] = df["created_time"].dt.dayofweek          # 0 = Thứ Hai
-    df["weekday_name"] = df["created_time"].dt.day_name()
     df["month"] = df["created_time"].dt.month
-    df["date"] = df["created_time"].dt.date
     df["is_weekend"] = (df["weekday"] >= 5).astype(int)
+    df["time_band"] = pd.cut(df["hour"], [-1, 5, 11, 13, 17, 23], labels=TIME_BANDS)
 
     # Đặc trưng nội dung
     df["n_hashtags"] = df["caption"].str.count(r"#\w+")
@@ -279,57 +281,61 @@ def analyze_content(df):
     by_type = (df.groupby("post_type")
                  .agg(so_bai=("post_id", "count"), like_tb=("likes", "mean"),
                       comment_tb=("comments", "mean"), share_tb=("shares", "mean"),
-                      engagement_tb=("target_metric", "mean"),
-                      engagement_median=("target_metric", "median"))
-                 .sort_values("engagement_tb", ascending=False).round(1))
+                      chi_so_trung_vi=(ANALYSIS_COL, "median"),
+                      chi_so_trung_binh=(ANALYSIS_COL, "mean"))
+                 .sort_values("chi_so_trung_vi", ascending=False).round(2))
     print("\n  >> Hiệu quả theo loại bài đăng:\n", by_type)
     res["by_type"] = by_type
 
     # 3.2 Theo số hashtag
     df["hashtag_group"] = pd.cut(df["n_hashtags"], [-1, 0, 2, 4, 100], labels=["0", "1-2", "3-4", "5+"])
-    by_tag = df.groupby("hashtag_group")["target_metric"].agg(["count", "mean"]).round(1)
+    by_tag = df.groupby("hashtag_group")[ANALYSIS_COL].agg(["count", "median"]).round(2)
     print("\n  >> Hiệu quả theo số hashtag:\n", by_tag)
     res["by_hashtag"] = by_tag
 
     # 3.3 Theo độ dài caption
     df["len_group"] = pd.qcut(df["caption_len"].rank(method="first"), 4,
                               labels=["Rất ngắn", "Ngắn", "Dài", "Rất dài"])
-    by_len = df.groupby("len_group")["target_metric"].agg(["count", "mean"]).round(1)
+    by_len = df.groupby("len_group")[ANALYSIS_COL].agg(["count", "median"]).round(2)
     print("\n  >> Hiệu quả theo độ dài caption:\n", by_len)
     res["by_len"] = by_len
 
     # 3.4 Câu hỏi / link / emoji
     for col, label in [("has_question", "Có câu hỏi"), ("has_link", "Có link"), ("n_emoji", "Số emoji")]:
-        g = df.groupby(df[col].clip(upper=3))["target_metric"].mean().round(1)
-        print(f"\n  >> {METRIC_LABEL} trung bình theo '{label}':\n", g)
+        g = df.groupby(df[col].clip(upper=3))[ANALYSIS_COL].median().round(2)
+        print(f"\n  >> {ANALYSIS_LABEL} (trung vị) theo '{label}':\n", g)
 
-    # 3.5 Từ khoá hiệu quả: trung bình engagement của các bài chứa từ đó
+    # 3.5 Từ khoá hiệu quả: trung vị chỉ số tương tác của các video chứa từ đó
     word_posts = []
-    for words, eng in zip(df["caption_clean"].str.split(), df["target_metric"]):
+    for words, eng in zip(df["caption_clean"].str.split(), df[ANALYSIS_COL]):
         for w in set(words):
             if len(w) > 2 and w not in STOPWORDS_VI:
                 word_posts.append((w, eng))
     wdf = pd.DataFrame(word_posts, columns=["word", "eng"])
-    kw = (wdf.groupby("word")["eng"].agg(["count", "mean"]).query("count >= 30")
-             .sort_values("mean", ascending=False).round(1))
-    print("\n  >> Top 10 từ khoá có engagement cao nhất:\n", kw.head(10))
+    kw = (wdf.groupby("word")["eng"].agg(["count", "median"]).query("count >= 30")
+             .sort_values("median", ascending=False).round(2))
+    print("\n  >> Top 10 từ khoá có chỉ số tương tác cao nhất (trung vị):\n", kw.head(10))
     res["keywords"] = kw
 
     # 3.6 Hashtag hiệu quả
     tag_rows = []
-    for cap, eng in zip(df["caption"], df["target_metric"]):
+    for cap, eng in zip(df["caption"], df[ANALYSIS_COL]):
         for t in set(re.findall(r"#\w+", cap.lower())):
             tag_rows.append((t, eng))
     if tag_rows:
         tdf = pd.DataFrame(tag_rows, columns=["hashtag", "eng"])
-        tags = (tdf.groupby("hashtag")["eng"].agg(["count", "mean"]).query("count >= 20")
-                   .sort_values("mean", ascending=False).round(1))
+        tags = (tdf.groupby("hashtag")["eng"].agg(["count", "median"]).query("count >= 20")
+                   .sort_values("median", ascending=False).round(2))
         print("\n  >> Hashtag hiệu quả nhất:\n", tags.head(10))
         res["hashtags"] = tags
 
     # 3.7 Top 10 bài tốt nhất
-    top = df.nlargest(10, "target_metric")[["post_id", "created_time", "post_type", "caption",
-                                             "total_engagement", "target_metric"]]
+    top_cols = ["post_id", "created_time", "post_type", "caption", "total_engagement", "target_metric"]
+    if "channel_title" in df.columns:
+        top_cols.insert(1, "channel_title")
+    if ANALYSIS_COL != "target_metric":
+        top_cols.append(ANALYSIS_COL)
+    top = df.nlargest(10, ANALYSIS_COL)[top_cols]
     res["top_posts"] = top
     return res
 
@@ -342,27 +348,27 @@ def analyze_time(df):
     res = {}
     day_names = ["T2", "T3", "T4", "T5", "T6", "T7", "CN"]
 
-    res["by_hour"] = df.groupby("hour")["target_metric"].mean().round(1)
-    res["by_weekday"] = df.groupby("weekday")["target_metric"].mean().round(1)
-    res["heatmap"] = df.pivot_table(index="weekday", columns="hour",
-                                    values="target_metric", aggfunc="mean")
+    res["by_hour"] = df.groupby("hour")[ANALYSIS_COL].median().round(2)
+    res["by_weekday"] = df.groupby("weekday")[ANALYSIS_COL].median().round(2)
+    res["heatmap"] = df.pivot_table(index="weekday", columns="time_band",
+                                    values=ANALYSIS_COL, aggfunc="median", observed=False)
     res["heatmap"].index = [day_names[i] for i in res["heatmap"].index]
 
     monthly = df.set_index("created_time").resample("MS").agg(
         so_bai=("post_id", "count"), likes=("likes", "sum"), comments=("comments", "sum"),
-        shares=("shares", "sum"), eng_tb=("target_metric", "mean"))
+        shares=("shares", "sum"), eng_tb=(ANALYSIS_COL, "median"))
     res["monthly"] = monthly
 
-    weekly = df.set_index("created_time")["target_metric"].resample("W").mean()
-    res["daily"] = weekly                                   # (giữ tên khoá cũ) trung bình theo tuần
+    weekly = df.set_index("created_time")[ANALYSIS_COL].resample("W").median()
+    res["daily"] = weekly                                   # (giữ tên khoá cũ) trung vị theo tuần
     res["daily_ma7"] = weekly.rolling(4, min_periods=1).mean()
     res["daily_ma30"] = weekly.rolling(12, min_periods=1).mean()
 
     best_hours = res["by_hour"].nlargest(3)
     best_day = res["by_weekday"].idxmax()
-    print(f"    - 3 khung giờ tốt nhất: {', '.join(f'{h}h ({v:.0f})' for h, v in best_hours.items())}")
+    print(f"    - 3 giờ đăng có chỉ số tương tác (trung vị) cao nhất: {', '.join(f'{h}h ({v:.2f})' for h, v in best_hours.items())}")
     print(f"    - Ngày trong tuần tốt nhất: {day_names[best_day]}")
-    print(f"    - Tháng engagement TB cao nhất: {monthly['eng_tb'].idxmax():%m/%Y}")
+    print(f"    - Tháng có chỉ số tương tác (trung vị) cao nhất: {monthly['eng_tb'].idxmax():%m/%Y}")
     return res
 
 
@@ -378,13 +384,23 @@ def has_channels(df):
 
 
 def add_channel_adjusted(df):
-    """metric_adj = log(1 + tỷ lệ tương tác) trừ trung bình của chính kênh đó.
-    So sánh trên cột này nghĩa là so sánh video TRONG NỘI BỘ từng kênh (loại hiệu ứng kênh)."""
+    """Tạo 2 cột kiểm soát yếu tố kênh:
+      - metric_adj: log(1 + tỷ lệ) trừ trung bình của kênh -> dùng cho kiểm định (mục 4B).
+      - rel_metric: tỷ lệ chia cho trung vị của kênh -> dùng cho bảng/biểu đồ (mục 3, 4, 5).
+    Khi chỉ có 1 kênh, các bảng/biểu đồ dùng thẳng tỷ lệ gốc."""
+    global ANALYSIS_COL, ANALYSIS_LABEL
     lg = np.log1p(df["target_metric"])
     if has_channels(df):
         df["metric_adj"] = lg - lg.groupby(df["channel_title"]).transform("mean")
+        overall = df["target_metric"].median()
+        med = df.groupby("channel_title")["target_metric"].transform("median")
+        med = med.where(med > 0, overall if overall > 0 else 1.0)       # trung vị = 0 -> dùng trung vị chung
+        df["rel_metric"] = df["target_metric"] / med
+        ANALYSIS_COL, ANALYSIS_LABEL = "rel_metric", REL_LABEL
     else:
         df["metric_adj"] = lg
+        df["rel_metric"] = df["target_metric"]
+        ANALYSIS_COL, ANALYSIS_LABEL = "target_metric", METRIC_LABEL
     return df
 
 
@@ -445,7 +461,11 @@ def run_test(t, df, col):
         h, p = stats.kruskal(*groups)
         n, k = sum(len(g) for g in groups), len(groups)
         return dict(p=p, eff=max(0.0, (h - k + 1) / (n - k)), kind="eps", sign=0)
+    if df[t["x"]].nunique() < 2 or y.nunique() < 2:      # cột không đổi -> không tính được tương quan
+        return None
     rho, p = stats.spearmanr(df[t["x"]], y)
+    if np.isnan(rho):
+        return None
     return dict(p=p, eff=rho, kind="r", sign=int(np.sign(rho)))
 
 
@@ -465,6 +485,8 @@ def channel_consistency(t, df, overall_sign):
             if len(g) < MIN_GROUP:
                 continue
             s = np.sign(stats.spearmanr(g[t["x"]], g["target_metric"])[0])
+            if np.isnan(s):                              # kênh có cột không đổi -> bỏ qua kênh này
+                continue
         total += 1
         same += int(s == overall_sign)
     return f"{same}/{total} kênh" if total else ""
@@ -607,9 +629,9 @@ def visualize(df, content, timeres):
 
     # 5.1 Phân phối engagement
     fig, ax = plt.subplots(1, 2, figsize=(12, 4))
-    sns.histplot(df["target_metric"], bins=50, kde=True, ax=ax[0], color="#4C72B0")
-    ax[0].set_title(f"Phân phối: {METRIC_LABEL}")
-    sns.histplot(np.log1p(df["target_metric"]), bins=50, kde=True, ax=ax[1], color="#55A868")
+    sns.histplot(df[ANALYSIS_COL], bins=50, kde=True, ax=ax[0], color="#4C72B0")
+    ax[0].set_title(f"Phân phối: {ANALYSIS_LABEL}")
+    sns.histplot(np.log1p(df[ANALYSIS_COL]), bins=50, kde=True, ax=ax[1], color="#55A868")
     ax[1].set_title("Phân phối log(1 + giá trị)")
     save_fig("01_phan_phoi_engagement.png")
 
@@ -635,36 +657,37 @@ def visualize(df, content, timeres):
 
     # 5.4 Boxplot theo loại
     plt.figure(figsize=(8, 5))
-    sns.boxplot(data=df, x="post_type", y="target_metric", showfliers=False, palette="Set2")
-    plt.title(f"Phân tán {METRIC_LABEL} theo loại bài đăng")
-    plt.ylabel(METRIC_LABEL)
+    sns.boxplot(data=df, x="post_type", y=ANALYSIS_COL, hue="post_type", showfliers=False, palette="Set2", legend=False)
+    plt.title(f"Phân tán {ANALYSIS_LABEL} theo loại bài đăng")
+    plt.ylabel(ANALYSIS_LABEL)
     save_fig("04_boxplot_loai_bai.png")
 
     # 5.5 Theo giờ & thứ
     fig, ax = plt.subplots(1, 2, figsize=(13, 4))
     timeres["by_hour"].plot(kind="line", marker="o", ax=ax[0], color="#C44E52")
-    ax[0].set_title(f"{METRIC_LABEL} TB theo giờ đăng")
+    ax[0].set_title(f"{ANALYSIS_LABEL} (trung vị) theo giờ đăng")
     ax[0].set_xlabel("Giờ trong ngày")
     ax[0].set_xticks(range(0, 24, 2))
-    sns.barplot(x=[day_names[i] for i in timeres["by_weekday"].index],
-                y=timeres["by_weekday"].values, ax=ax[1], palette="Blues_d")
-    ax[1].set_title(f"{METRIC_LABEL} TB theo thứ")
+    wk_labels = [day_names[i] for i in timeres["by_weekday"].index]
+    sns.barplot(x=wk_labels, y=timeres["by_weekday"].values, hue=wk_labels, ax=ax[1],
+                palette="Blues_d", legend=False)
+    ax[1].set_title(f"{ANALYSIS_LABEL} (trung vị) theo thứ")
     save_fig("05_theo_gio_va_thu.png")
 
     # 5.6 Heatmap
-    plt.figure(figsize=(13, 4.5))
-    sns.heatmap(timeres["heatmap"], cmap="YlOrRd", cbar_kws={"label": f"{METRIC_LABEL} TB"})
-    plt.title("Heatmap: thứ x giờ đăng")
-    plt.xlabel("Giờ")
+    plt.figure(figsize=(10, 4.5))
+    sns.heatmap(timeres["heatmap"], cmap="YlOrRd", cbar_kws={"label": f"{ANALYSIS_LABEL} (trung vị)"})
+    plt.title(f"Heatmap: thứ x khung giờ đăng ({ANALYSIS_LABEL}, trung vị)")
+    plt.xlabel("Khung giờ")
     plt.ylabel("")
     save_fig("06_heatmap_thu_gio.png")
 
     # 5.7 Xu hướng theo thời gian
     plt.figure(figsize=(13, 4.5))
-    plt.plot(timeres["daily"], alpha=.3, color="gray", label="TB theo tuần")
+    plt.plot(timeres["daily"], alpha=.3, color="gray", label="Trung vị theo tuần")
     plt.plot(timeres["daily_ma7"], label="TB trượt 4 tuần", color="#4C72B0")
     plt.plot(timeres["daily_ma30"], label="TB trượt 12 tuần", color="#C44E52", lw=2)
-    plt.title(f"Xu hướng {METRIC_LABEL} theo thời gian")
+    plt.title(f"Xu hướng {ANALYSIS_LABEL} theo thời gian")
     plt.legend()
     save_fig("07_xu_huong_thoi_gian.png")
 
@@ -680,22 +703,24 @@ def visualize(df, content, timeres):
 
     # 5.9 Hashtag & độ dài
     fig, ax = plt.subplots(1, 2, figsize=(12, 4))
-    content["by_hashtag"]["mean"].plot(kind="bar", ax=ax[0], color="#8172B2", rot=0)
-    ax[0].set_title(f"{METRIC_LABEL} TB theo số hashtag")
-    content["by_len"]["mean"].plot(kind="bar", ax=ax[1], color="#937860", rot=0)
-    ax[1].set_title(f"{METRIC_LABEL} TB theo độ dài caption")
+    content["by_hashtag"]["median"].plot(kind="bar", ax=ax[0], color="#8172B2", rot=0)
+    ax[0].set_title(f"{ANALYSIS_LABEL} (trung vị) theo số hashtag")
+    content["by_len"]["median"].plot(kind="bar", ax=ax[1], color="#937860", rot=0)
+    ax[1].set_title(f"{ANALYSIS_LABEL} (trung vị) theo độ dài caption")
     save_fig("09_hashtag_do_dai.png")
 
     # 5.10 Top từ khoá
     kw = content["keywords"].head(12).iloc[::-1]
     plt.figure(figsize=(8, 5))
-    plt.barh(kw.index, kw["mean"], color="#64B5CD")
-    plt.title(f"Top từ khoá có {METRIC_LABEL} TB cao nhất")
+    plt.barh(kw.index, kw["median"], color="#64B5CD")
+    plt.title(f"Top từ khoá có {ANALYSIS_LABEL} (trung vị) cao nhất")
     save_fig("10_top_tu_khoa.png")
 
     # 5.11 Tương quan
     cols = ["likes", "comments", "shares", "total_engagement", "target_metric", "caption_len",
             "n_hashtags", "n_emoji", "has_link", "has_question", "hour"]
+    if ANALYSIS_COL != "target_metric":
+        cols.append(ANALYSIS_COL)
     if "views" in df.columns:
         cols.insert(0, "views")
     if "duration_sec" in df.columns:
@@ -904,7 +929,7 @@ def main():
     df_raw = load_data(path)
     df = clean_data(df_raw)
     df = add_channel_adjusted(df)
-    df.drop(columns=["date"]).to_csv(os.path.join(OUTPUT_DIR, "posts_cleaned.csv"),
+    df.to_csv(os.path.join(OUTPUT_DIR, "posts_cleaned.csv"),
                                      index=False, encoding="utf-8-sig")
 
     content = analyze_content(df)

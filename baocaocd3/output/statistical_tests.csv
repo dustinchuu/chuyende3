@@ -1,9 +1,9 @@
 ﻿Giả thuyết,Mô tả nhóm,p Holm (gốc),Hiệu ứng (gốc),Mức độ (gốc),p Holm (kiểm soát kênh),Hiệu ứng (kiểm soát kênh),Cùng chiều theo kênh,Kết luận
-H1: Hình thức video (short/medium/long/live) làm tỷ lệ tương tác khác nhau,live: 1.28 (n=1254) | long: 1.07 (n=462) | medium: 1.37 (n=199) | short: 0.90 (n=250),0.0,0.0727,trung bình,0.0,0.0549,,Có ý nghĩa và vẫn giữ nguyên sau khi kiểm soát kênh
-H2: Video ngắn (<=60 giây) vs video dài (>10 phút),ngắn: trung vị 0.90 (n=250) | dài: trung vị 1.07 (n=462),0.0112,-0.1315,nhỏ,0.0,0.2586,0/2 kênh,Có ý nghĩa và vẫn giữ nguyên sau khi kiểm soát kênh
-H3: Đăng buổi tối (18-23h) vs các khung giờ khác,tối: trung vị 1.13 (n=877) | khác: trung vị 1.24 (n=1288),0.0,-0.1265,nhỏ,0.0,-0.2258,4/5 kênh,Có ý nghĩa và vẫn giữ nguyên sau khi kiểm soát kênh
-H4: Đăng cuối tuần vs ngày thường,cuối tuần: trung vị 1.10 (n=576) | ngày thường: trung vị 1.22 (n=1589),0.0023,-0.0966,không đáng kể,0.0303,-0.0723,4/5 kênh,Có ý nghĩa và vẫn giữ nguyên sau khi kiểm soát kênh; hiệu ứng rất nhỏ
-H5: Tiêu đề có dấu '?' vs không có,có ?: trung vị 1.38 (n=93) | không ?: trung vị 1.18 (n=2072),0.051,0.1273,nhỏ,0.6012,0.032,2/3 kênh,Chưa đủ bằng chứng (không bác bỏ được giả thuyết không)
-H6: Có hashtag vs không có hashtag,có hashtag: trung vị 1.24 (n=1654) | không hashtag: trung vị 1.13 (n=511),0.0,0.1406,nhỏ,0.0013,-0.105,0/2 kênh,Có ý nghĩa và vẫn giữ nguyên sau khi kiểm soát kênh
-H7: Độ dài tiêu đề tương quan với tỷ lệ tương tác,Spearman rho giữa caption_len và tỷ lệ tương tác,0.0,-0.2696,nhỏ,0.0,-0.2632,5/5 kênh,Có ý nghĩa và vẫn giữ nguyên sau khi kiểm soát kênh
-H8: Thời lượng video tương quan với tỷ lệ tương tác,Spearman rho giữa duration_sec và tỷ lệ tương tác,0.051,0.048,không đáng kể,0.1546,-0.038,2/5 kênh,Chưa đủ bằng chứng (không bác bỏ được giả thuyết không)
+H1: Hình thức video (short/medium/long/live) làm tỷ lệ tương tác khác nhau,live: 1.28 (n=1254) | long: 1.07 (n=462) | medium: 1.37 (n=198) | short: 0.91 (n=249),0.0,0.0734,trung bình,0.0,0.0574,,Có ý nghĩa và vẫn giữ nguyên sau khi kiểm soát kênh
+H2: Video ngắn (<=60 giây) vs video dài (>10 phút),ngắn: trung vị 0.91 (n=249) | dài: trung vị 1.07 (n=462),0.0131,-0.1295,nhỏ,0.0,0.2647,0/2 kênh,Có ý nghĩa và vẫn giữ nguyên sau khi kiểm soát kênh
+H3: Đăng buổi tối (18-23h) vs các khung giờ khác,tối: trung vị 1.14 (n=876) | khác: trung vị 1.24 (n=1287),0.0,-0.1241,nhỏ,0.0,-0.2259,4/5 kênh,Có ý nghĩa và vẫn giữ nguyên sau khi kiểm soát kênh
+H4: Đăng cuối tuần vs ngày thường,cuối tuần: trung vị 1.10 (n=575) | ngày thường: trung vị 1.22 (n=1588),0.0033,-0.094,không đáng kể,0.0479,-0.0677,4/5 kênh,Có ý nghĩa và vẫn giữ nguyên sau khi kiểm soát kênh; hiệu ứng rất nhỏ
+H5: Tiêu đề có dấu '?' vs không có,có ?: trung vị 1.38 (n=93) | không ?: trung vị 1.19 (n=2070),0.0572,0.128,nhỏ,0.562,0.0355,2/3 kênh,Chưa đủ bằng chứng (không bác bỏ được giả thuyết không)
+H6: Có hashtag vs không có hashtag,có hashtag: trung vị 1.24 (n=1651) | không hashtag: trung vị 1.13 (n=512),0.0,0.1385,nhỏ,0.0045,-0.0952,0/2 kênh,Có ý nghĩa và vẫn giữ nguyên sau khi kiểm soát kênh
+H7: Độ dài tiêu đề tương quan với tỷ lệ tương tác,Spearman rho giữa caption_len và tỷ lệ tương tác,0.0,-0.2727,nhỏ,0.0,-0.2647,5/5 kênh,Có ý nghĩa và vẫn giữ nguyên sau khi kiểm soát kênh
+H8: Thời lượng video tương quan với tỷ lệ tương tác,Spearman rho giữa duration_sec và tỷ lệ tương tác,0.0572,0.0471,không đáng kể,0.1732,-0.0369,2/5 kênh,Chưa đủ bằng chứng (không bác bỏ được giả thuyết không)

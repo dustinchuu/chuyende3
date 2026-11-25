@@ -1,6 +1,6 @@
 ﻿Mô hình,R2 (log),R2 CV theo thời gian (TB),R2 CV (độ lệch chuẩn),MAE (đơn vị thước đo),RMSE (đơn vị thước đo),MAE giảm so với baseline (%)
-Baseline (luôn đoán bằng trung bình),-1.369,-0.787,0.586,0.713,0.81,0.0
-Linear Regression,-0.416,-0.25,0.392,0.513,0.669,28.006
-Random Forest,0.131,-0.141,0.409,0.325,0.586,54.346
-Gradient Boosting,-0.426,-0.359,0.536,0.489,0.701,31.325
-Random Forest + biến kênh,0.134,-0.123,0.329,0.325,0.586,54.457
+Baseline (luôn đoán bằng trung bình),-1.402,-0.813,0.561,0.707,0.79,0.0
+Linear Regression,-0.426,-0.262,0.399,0.508,0.642,28.156
+Random Forest,0.141,-0.091,0.333,0.321,0.552,54.637
+Gradient Boosting,-0.47,-0.4,0.556,0.497,0.676,29.732
+Random Forest + biến kênh,0.147,-0.083,0.276,0.318,0.551,54.945
